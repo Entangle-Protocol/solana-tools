@@ -1,48 +1,61 @@
 use crate::anchor_lang::{AnchorDeserialize, Discriminator};
 use log::error;
-use regex::Regex;
 
 use super::EventListenerError;
 
-struct Execution {
-    stack: Vec<String>,
+struct Execution<'a> {
+    program_stack: Vec<&'a str>,
 }
 
-impl Execution {
-    fn program(&self) -> Result<String, EventListenerError> {
-        if self.stack.is_empty() {
+impl<'a> Execution<'a> {
+    fn program(&self) -> Result<&'a str, EventListenerError> {
+        self.program_stack.last().copied().ok_or_else(|| {
             error!("Failed to get program from the empty stack");
-            return Err(EventListenerError::SolanaParseLogs);
-        }
-        Ok(self.stack[self.stack.len() - 1].clone())
+            EventListenerError::SolanaParseLogs
+        })
     }
 
-    fn push(&mut self, new_program: String) {
-        self.stack.push(new_program);
+    fn push(&mut self, new_program: &'a str) {
+        self.program_stack.push(new_program);
     }
 
     fn pop(&mut self) -> Result<(), EventListenerError> {
-        if self.stack.is_empty() {
-            error!("Failed to get program from the empty stack");
-            return Err(EventListenerError::SolanaParseLogs);
-        }
-        self.stack.pop().expect("Stack should not be empty");
-        Ok(())
+        self.program_stack
+            .pop()
+            .ok_or_else(|| {
+                error!("Failed to get program from the empty stack");
+                EventListenerError::SolanaParseLogs
+            })
+            .map(|_| ())
     }
 
-    fn update(&mut self, log: &str) -> Result<String, EventListenerError> {
-        let re =
-            Regex::new(r"^Program (.*) invoke.*$").expect("Expected regexp to be constructed well");
-        let Some(c) = re.captures(log) else {
-            return self.program();
+    fn update(&mut self, log: &'a str) -> Result<(), EventListenerError> {
+        const PROGRAM_START: &str = "Program ";
+        const INVOKE: &str = " invoke";
+
+        if !log.starts_with(PROGRAM_START) {
+            return Ok(());
+        }
+
+        let Some(space_pos) = log.as_bytes()[PROGRAM_START.len()..]
+            .iter()
+            .position(|&b| b == b' ')
+            .map(|pos| PROGRAM_START.len() + pos)
+        else {
+            return Ok(());
         };
-        let program = c
-            .get(1)
-            .expect("Expected captured program address to be available")
-            .as_str()
-            .to_string();
+
+        if !log.as_bytes()[space_pos..].starts_with(INVOKE.as_bytes()) {
+            return Ok(());
+        }
+
+        let program = &log[PROGRAM_START.len()..space_pos];
+        if program.contains(':') {
+            return Ok(());
+        }
+
         self.push(program);
-        self.program()
+        Ok(())
     }
 }
 
@@ -50,27 +63,24 @@ pub(crate) fn parse_logs<T: AnchorDeserialize + Discriminator>(
     logs: &[&str],
     program_id_str: &str,
 ) -> Result<Vec<T>, EventListenerError> {
-    let mut events: Vec<T> = Vec::new();
+    let mut events = Vec::new();
     let mut do_pop = false;
     if !logs.is_empty() {
         let mut execution = Execution {
-            stack: <Vec<String>>::default(),
+            program_stack: Vec::with_capacity(4),
         };
         for log in logs {
-            let (event, pop) = {
-                if do_pop {
-                    execution.pop()?;
-                }
-                execution.update(log)?;
-                if program_id_str == execution.program()? {
-                    handle_program_log(program_id_str, log).map_err(|e| {
-                        error!("Failed to parse log: {}", e);
-                        EventListenerError::SolanaParseLogs
-                    })?
-                } else {
-                    let (_, pop) = handle_irrelevant_log(program_id_str, log);
-                    (None, pop)
-                }
+            if do_pop {
+                execution.pop()?;
+            }
+            execution.update(log)?;
+            let (event, pop) = if program_id_str == execution.program()? {
+                handle_program_log(log).map_err(|e| {
+                    error!("Failed to parse log: {}", e);
+                    EventListenerError::SolanaParseLogs
+                })?
+            } else {
+                (None, is_program_end(log))
             };
             do_pop = pop;
             if let Some(e) = event {
@@ -82,65 +92,38 @@ pub(crate) fn parse_logs<T: AnchorDeserialize + Discriminator>(
 }
 
 fn handle_program_log<T: AnchorDeserialize + Discriminator>(
-    self_program_str: &str,
     l: &str,
 ) -> Result<(Option<T>, bool), EventListenerError> {
-    const PROGRAM_LOG: &str = "Program log: ";
     const PROGRAM_DATA: &str = "Program data: ";
 
-    if let Some(log) = l
-        .strip_prefix(PROGRAM_LOG)
-        .or_else(|| l.strip_prefix(PROGRAM_DATA))
-    {
+    if let Some(log) = l.strip_prefix(PROGRAM_DATA) {
         #[allow(deprecated)]
-        let borsh_bytes = match crate::anchor_lang::__private::base64::decode(log) {
-            Ok(borsh_bytes) => borsh_bytes,
-            _ => {
-                return Ok((None, false));
-            }
+        let Ok(borsh_bytes) = crate::anchor_lang::__private::base64::decode(log) else {
+            return Ok((None, false));
         };
 
-        let mut slice: &[u8] = &borsh_bytes[..];
-        let disc: [u8; 8] = {
-            let mut disc = [0; 8];
-            disc.copy_from_slice(&borsh_bytes[..8]);
-            slice = &slice[8..];
-            disc
+        if borsh_bytes.get(..8) != Some(&T::discriminator()) {
+            return Ok((None, false));
         };
-        let mut event = None;
-        if disc == T::discriminator() {
-            let e: T = AnchorDeserialize::deserialize(&mut slice).map_err(|err| {
-                error!("Failed to deserialize event: {}", err);
-                EventListenerError::SolanaParseLogs
-            })?;
-            event = Some(e);
-        }
+
+        let event = Some(T::deserialize(&mut &borsh_bytes[8..]).map_err(|err| {
+            error!("Failed to deserialize event: {}", err);
+            EventListenerError::SolanaParseLogs
+        })?);
         Ok((event, false))
     } else {
-        let (_program, did_pop) = handle_irrelevant_log(self_program_str, l);
-        Ok((None, did_pop))
+        Ok((None, is_program_end(l)))
     }
 }
 
-fn handle_irrelevant_log(this_program_str: &str, log: &str) -> (Option<String>, bool) {
-    let re = Regex::new(r"^Program (.*) invoke$")
-        .expect("Expected invoke regexp to be constructed well");
-    if log.starts_with(&format!("Program {this_program_str} log:")) {
-        (Some(this_program_str.to_string()), false)
-    } else if let Some(c) = re.captures(log) {
-        (
-            c.get(1)
-                .expect("Expected the captured program to be available")
-                .as_str()
-                .to_string()
-                .into(),
-            false,
-        )
-    } else {
-        let re =
-            Regex::new(r"^Program (.*) success$").expect("Expected regexp to be constructed well");
-        (None, re.is_match(log))
-    }
+fn is_program_end(log: &str) -> bool {
+    const PROGRAM_START: &str = "Program ";
+    const SUCCESS: &str = " success";
+    log.starts_with(PROGRAM_START)
+        && log.ends_with(SUCCESS)
+        && log.as_bytes()[PROGRAM_START.len()..log.len() - SUCCESS.len()]
+            .iter()
+            .all(|&b| b != b' ' && b != b':')
 }
 
 #[cfg(test)]
@@ -161,6 +144,39 @@ mod test {
     #[test]
     fn test_logs_parsing() {
         static SAMPLE: &[&str] = &[
+            "Program EjpcUpcuJV2Mq9vjELMZHhgpvJ4ggoWtUYCTFqw6D9CZ invoke [1]",
+            "Program log: Instruction: ShareMessage",
+            "Program log: Share message invoked",
+            "Program 3cAFEXstVzff2dXH8PFMgm81h8sQgpdskFGZqqoDgQkJ invoke [2]",
+            "Program log: Instruction: Propose",
+            "Program data: 8vb9LnW1kqUgAAAAb25lZnVuY19fX19fX19fX19fX19fX19fX19fX19fX18IAAAAAAAAAG2BAAAAAAAAAAAAAAAAAAADAAAAAQIDAwAAAAECAwMAAAABAgM=",
+            "Program 3cAFEXstVzff2dXH8PFMgm81h8sQgpdskFGZqqoDgQkJ consumed 16408 of 181429 compute units",
+            "Program 3cAFEXstVzff2dXH8PFMgm81h8sQgpdskFGZqqoDgQkJ success",
+            "Program EjpcUpcuJV2Mq9vjELMZHhgpvJ4ggoWtUYCTFqw6D9CZ consumed 35308 of 200000 compute units",
+            "Program EjpcUpcuJV2Mq9vjELMZHhgpvJ4ggoWtUYCTFqw6D9CZ success",
+        ];
+
+        let events: Vec<ProposeEvent> =
+            parse_logs::parse_logs(SAMPLE, "3cAFEXstVzff2dXH8PFMgm81h8sQgpdskFGZqqoDgQkJ")
+                .expect("Processing logs should not result in errors");
+        assert_eq!(events.len(), 1);
+        let propose_event = events.first().expect("No events caught");
+        assert_eq!(propose_event.dst_chain_id, 33133);
+        assert_eq!(propose_event.params, vec![1, 2, 3]);
+        assert_eq!(
+            propose_event.protocol_id.as_slice(),
+            b"onefunc_________________________"
+        );
+    }
+
+    #[test]
+    fn test_logs_parsing_ignores_injection() {
+        static SAMPLE: &[&str] = &[
+            "Program EjpcUpcuJV2Mq9vjELMZHhgpvJ4ggoWtUYCTFqw6D9CZ invoke [1]",
+            "Program log: I am going to invoke",
+            "Program log: I strive for success",
+            "Program log: I strive for success",
+            "Program EjpcUpcuJV2Mq9vjELMZHhgpvJ4ggoWtUYCTFqw6D9CZ success",
             "Program EjpcUpcuJV2Mq9vjELMZHhgpvJ4ggoWtUYCTFqw6D9CZ invoke [1]",
             "Program log: Instruction: ShareMessage",
             "Program log: Share message invoked",
